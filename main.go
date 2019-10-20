@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"flag"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
@@ -12,28 +14,49 @@ import (
 	"github.com/howeyc/fsnotify"
 )
 
-// todo: add support for copy and delete
-// todo: change into a command line code
+var operationKeywords map[string]string
+
+func init() {
+	operationKeywords = map[string]string{
+		"move":   "mv",
+		"copy":   "cp",
+		"delete": "rm",
+	}
+}
 
 func main() {
+
+	var operationType string
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "-t	-type specifies the kind of operation to run, values are: move, copy, delete")
+	}
+
+	flag.StringVar(&operationType, "type", "none", "specifies what kind of operation to run possible values are move, copy, delete")
+	flag.StringVar(&operationType, "t", "none", "specifies what kind of operation to run possible values are move, copy, delete")
+
+	flag.Parse()
+
+	if _, ok := operationKeywords[operationType]; !ok {
+		log.Println("Possible values for the -t -type flag are: move, copy, delete")
+		os.Exit(1)
+	}
+
 	configFile, err := getConfigFile()
 	if err != nil {
-		log.Println("couldn't work with config file", err)
+		log.Printf("Error with config.json file: %v", err)
 	}
 
 	var config Config
 	err = json.Unmarshal(configFile, &config)
 	if err != nil {
-		log.Println("couldn't unmarshal configFile", err)
+		log.Println("couldn't unmarshal config.json file", err)
 	}
 
-	err = watchAndDo(config)
-	if err != nil {
-		log.Println("couldn't watch and do", err)
-	}
+	watch(operationType, config)
 }
 
-// getConfigFile will look for a config file from where the command is being called
+// getConfigFile will look for a config.json file from where the command is being called
 func getConfigFile() ([]byte, error) {
 	cmd := exec.Command("pwd")
 	dir, err := cmd.Output()
@@ -51,7 +74,7 @@ func getConfigFile() ([]byte, error) {
 	return configFile, nil
 }
 
-func watch(path, destination string, files []string, fn operationFunc) {
+func watch(operation string, config Config) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		log.Println(err)
@@ -59,7 +82,11 @@ func watch(path, destination string, files []string, fn operationFunc) {
 
 	defer watcher.Close()
 	done := make(chan bool)
+	runner := false
 	go func() {
+		if !runner {
+			do(config, operation)
+		}
 		for {
 			select {
 			case event, ok := <-watcher.Event:
@@ -67,7 +94,7 @@ func watch(path, destination string, files []string, fn operationFunc) {
 					return
 				}
 				if event.IsCreate() {
-					fn(path, destination, files)
+					do(config, operation)
 				}
 			case err, ok := <-watcher.Error:
 				if !ok {
@@ -77,70 +104,82 @@ func watch(path, destination string, files []string, fn operationFunc) {
 			}
 		}
 	}()
-	err = watcher.Watch(path)
-	if err != nil {
-		log.Fatal(err)
+	paths := getConfigPaths(config)
+
+	// start watching all the paths concurrently
+	for _, i := range paths {
+		go func(path string) {
+			err = watcher.Watch(path)
+			if err != nil {
+				log.Fatal(err)
+			}
+		}(i)
 	}
 	<-done
 }
 
-func watchAndDo(config Config) error {
-	// watch the folder in config.file.watch
-	// if file exists in there send it to destination
-
-	done := make(chan string)
-	var codeErr error
+// do finds the files in the watch folder and starts performing the operation
+func do(config Config, op string) error {
 
 	for _, i := range config.File {
+		var foundFiles []string
 
-		go func(configOp FileStruct) {
-			var foundFiles []string
+		folder, err := os.Open(i.Watch)
+		if err != nil {
+			return errors.New("couldn't open watch folder \n:" + err.Error())
+		}
 
-			folder, err := os.Open(configOp.Watch)
-			if err != nil {
-				log.Printf("couldn't open watch folder \n%v", err)
-				os.Exit(1)
-			}
+		files, err := folder.Readdirnames(0)
+		if err != nil {
+			return errors.New("couldn't read from watch folder \n:" + err.Error())
+		}
 
-			files, err := folder.Readdirnames(0)
-			if err != nil {
-				log.Printf("couldn't read from watch folder \n%v", err)
-				os.Exit(1)
-			}
-
-			for _, extension := range configOp.Extensions {
-				for _, fileName := range files {
-					if strings.HasSuffix(fileName, extension) {
-						foundFiles = append(foundFiles, fileName)
-					}
+		for _, extension := range i.Extensions {
+			for _, fileName := range files {
+				if strings.HasSuffix(fileName, extension) {
+					foundFiles = append(foundFiles, fileName)
 				}
 			}
+		}
 
-			// run code once and then start running watch
-			err = operation(configOp.Watch, configOp.Destination, foundFiles)
-			if err != nil {
-				log.Printf("couldn't run intended operation \n%v", err)
-				os.Exit(1)
-			}
-
-			watch(configOp.Watch, configOp.Destination, foundFiles, operation)
-
-		}(i)
-
-	}
-	<-done
-	return codeErr
-}
-
-func operation(oldPath, newPath string, files []string) error {
-	for _, singleFile := range files {
-		oldFilePath := oldPath + "/" + singleFile
-
-		cmd := exec.Command("mv", oldFilePath, newPath)
-		err := cmd.Run()
+		err = operation(op, i.Watch, i.Destination, foundFiles)
 		if err != nil {
-			return err
+			return errors.New("couldn't run intended operation \n" + err.Error())
 		}
 	}
 	return nil
+}
+
+func getConfigPaths(config Config) []string {
+	var watchPaths []string
+
+	for _, i := range config.File {
+		watchPaths = append(watchPaths, i.Watch)
+	}
+	return watchPaths
+}
+
+func operation(op, oldPath, newPath string, files []string) error {
+	operationType := operationKeywords[op]
+
+	var err error
+	if operationType == "mv" || operationType == "cp" {
+
+		for _, singleFile := range files {
+			oldFilePath := oldPath + "/" + singleFile
+
+			cmd := exec.Command(operationType, oldFilePath, newPath)
+			err = cmd.Run()
+		}
+	} else if operationType == "rm" {
+
+		for _, singleFile := range files {
+			oldFilePath := oldPath + "/" + singleFile
+
+			cmd := exec.Command(operationType, oldFilePath)
+			err = cmd.Run()
+		}
+
+	}
+	return err
 }
