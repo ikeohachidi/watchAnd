@@ -11,5 +11,3 @@ type FileStruct struct {
 	Watch       string   `json:"watch"`
 	Destination string   `json:"destination"`
 }
-
-type operationFunc func(path, destination string, files []string) error
